@@ -156,6 +156,11 @@ impl AppCell {
         self.try_borrow_mut().unwrap()
     }
 
+    /// Whether the App is borrowed now: a platform callback runs inside an update.
+    pub(crate) fn is_borrowed(&self) -> bool {
+        self.app.try_borrow_mut().is_err()
+    }
+
     #[doc(hidden)]
     #[track_caller]
     pub fn try_borrow_mut(&self) -> Result<AppRefMut<'_>> {

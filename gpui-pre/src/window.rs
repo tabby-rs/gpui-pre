@@ -1634,6 +1634,41 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
     window_bounds_ctor(Bounds::new(final_origin, base_size))
 }
 
+/// Runs `f` on the window now or, when the App is already borrowed (a platform call made inside
+/// an update delivered the event synchronously, or a nested message loop ran it), on the
+/// foreground executor once the borrow ends, instead of dropping the event.
+fn update_or_defer(
+    handle: AnyWindowHandle,
+    cx: &crate::AsyncApp,
+    what: &'static str,
+    f: impl FnOnce(&mut Window, &mut App) + 'static,
+) {
+    let f = Rc::new(RefCell::new(Some(f)));
+    let mut now = cx.clone();
+    let run = f.clone();
+    let updated = handle.update(&mut now, move |_, window, cx| {
+        if let Some(f) = run.borrow_mut().take() {
+            f(window, cx);
+        }
+    });
+    if updated.is_ok() || f.borrow().is_none() {
+        return;
+    }
+    let mut later = cx.clone();
+    cx.foreground_executor()
+        .spawn(async move {
+            handle
+                .update(&mut later, move |_, window, cx| {
+                    if let Some(f) = f.borrow_mut().take() {
+                        f(window, cx);
+                    }
+                })
+                .with_context(|| format!("{what} for window {:?}", handle.window_id()))
+                .log_err();
+        })
+        .detach();
+}
+
 impl Window {
     pub(crate) fn new(
         handle: AnyWindowHandle,
@@ -1923,6 +1958,14 @@ impl Window {
                     profiler::journal::record_reentrant_frame_skipped(window_id, Instant::now());
                     return;
                 }
+                // Likewise while the App is borrowed: a platform call made inside an update
+                // (`ShowWindow`, `SetWindowPos` on Windows) sends the messages that request a
+                // frame at once. The window stays invalidated, so the next request draws it.
+                if cx.app.upgrade().is_some_and(|app| app.is_borrowed()) {
+                    log::debug!("deferring window draw request made while the app is borrowed");
+                    deferred_force_render |= request_frame_options.force_render;
+                    return;
+                }
                 // Take the deferred flag first: `||` short-circuits, and leaving
                 // the flag set when this request already forces a render would
                 // force a second, redundant render on the next frame.
@@ -2121,21 +2164,19 @@ impl Window {
             }
         }));
         platform_window.on_resize(Box::new({
-            let mut cx = cx.to_async();
+            let cx = cx.to_async();
             move |_, _| {
-                handle
-                    .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
-                    .with_context(|| format!("handling resize for window {:?}", handle.window_id()))
-                    .log_err();
+                update_or_defer(handle, &cx, "handling resize", |window, cx| {
+                    window.bounds_changed(cx)
+                });
             }
         }));
         platform_window.on_moved(Box::new({
-            let mut cx = cx.to_async();
+            let cx = cx.to_async();
             move || {
-                handle
-                    .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
-                    .with_context(|| format!("handling move for window {:?}", handle.window_id()))
-                    .log_err();
+                update_or_defer(handle, &cx, "handling move", |window, cx| {
+                    window.bounds_changed(cx)
+                });
             }
         }));
         platform_window.on_display_changed(Box::new({
@@ -2179,10 +2220,13 @@ impl Window {
             }
         }));
         platform_window.on_active_status_change(Box::new({
-            let mut cx = cx.to_async();
+            let cx = cx.to_async();
             move |active| {
-                handle
-                    .update(&mut cx, |_, window, cx| {
+                update_or_defer(
+                    handle,
+                    &cx,
+                    "handling active status change",
+                    move |window, cx| {
                         window.active.set(active);
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
@@ -2195,14 +2239,8 @@ impl Window {
                         window.refresh();
 
                         SystemWindowTabController::update_last_active(cx, window.handle.id);
-                    })
-                    .with_context(|| {
-                        format!(
-                            "handling active status change for window {:?}",
-                            handle.window_id()
-                        )
-                    })
-                    .log_err();
+                    },
+                );
             }
         }));
         platform_window.on_visibility_change(Box::new({
